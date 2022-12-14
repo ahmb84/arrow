@@ -443,11 +443,11 @@ func (d *TestDecryptionSuite) TestDecryption() {
 	}{
 		{"uniform_encryption.parquet.encrypted", 1},
 		// Commenting the tests below to decrease noise
-		{"encrypt_columns_and_footer.parquet.encrypted", 2},
-		{"encrypt_columns_plaintext_footer.parquet.encrypted", 3},
-		{"encrypt_columns_and_footer_aad.parquet.encrypted", 4},
-		{"encrypt_columns_and_footer_disable_aad_storage.parquet.encrypted", 5},
-		{"encrypt_columns_and_footer_ctr.parquet.encrypted", 6},
+		// {"encrypt_columns_and_footer.parquet.encrypted", 2},
+		// {"encrypt_columns_plaintext_footer.parquet.encrypted", 3},
+		// {"encrypt_columns_and_footer_aad.parquet.encrypted", 4},
+		// {"encrypt_columns_and_footer_disable_aad_storage.parquet.encrypted", 5},
+		// {"encrypt_columns_and_footer_ctr.parquet.encrypted", 6},
 	}
 	for _, tt := range tests {
 		d.Run(tt.file, func() {
