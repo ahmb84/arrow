@@ -18,7 +18,6 @@ package parquet_test
 
 import (
 	"encoding/binary"
-	"fmt"
 	"os"
 	"path"
 	"testing"
@@ -99,6 +98,7 @@ type TestDecryptionSuite struct {
 	colEncryptionKey1   string
 	colEncryptionKey2   string
 	fileName            string
+	rowsPerRG           int // added this field to test the number of rows
 }
 
 func (d *TestDecryptionSuite) TearDownSuite() {
@@ -117,6 +117,7 @@ func (d *TestDecryptionSuite) SetupSuite() {
 	d.colEncryptionKey1 = ColumnEncryptionKey1
 	d.colEncryptionKey2 = ColumnEncryptionKey2
 	d.fileName = FileName
+	d.rowsPerRG = 50 // same value as the encryption test
 
 	d.createDecryptionConfigs()
 }
@@ -193,6 +194,7 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 
 		// get column chunk metadata for boolean column
 		boolMd, _ := rgMeta.ColumnChunk(0)
+		d.EqualValues(boolMd.NumValues(), d.rowsPerRG)
 
 		// Read all rows in column
 		i := 0
@@ -220,6 +222,7 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 		int32reader := colReader.(*file.Int32ColumnChunkReader)
 
 		int32md, _ := rgMeta.ColumnChunk(1)
+		d.EqualValues(int32md.NumValues(), d.rowsPerRG)
 		// Read all rows in column
 		i = 0
 		for int32reader.HasNext() {
@@ -245,6 +248,7 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 		int64reader := colReader.(*file.Int64ColumnChunkReader)
 
 		int64md, _ := rgMeta.ColumnChunk(2)
+		d.EqualValues(int64md.NumValues(), d.rowsPerRG)
 		// Read all rows in column
 		i = 0
 		for int64reader.HasNext() {
@@ -281,6 +285,8 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 		int96reader := colReader.(*file.Int96ColumnChunkReader)
 
 		int96md, _ := rgMeta.ColumnChunk(3)
+		d.EqualValues(int96md.NumValues(), d.rowsPerRG)
+
 		// Read all rows in column
 		i = 0
 		for int96reader.HasNext() {
@@ -316,6 +322,7 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 			floatReader := colReader.(*file.Float32ColumnChunkReader)
 
 			floatmd, _ := rgMeta.ColumnChunk(4)
+			d.EqualValues(floatmd.NumValues(), d.rowsPerRG)
 
 			i = 0
 			for floatReader.HasNext() {
@@ -342,6 +349,7 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 			dblReader := colReader.(*file.Float64ColumnChunkReader)
 
 			dblmd, _ := rgMeta.ColumnChunk(5)
+			d.EqualValues(dblmd.NumValues(), d.rowsPerRG)
 
 			i = 0
 			for dblReader.HasNext() {
@@ -368,6 +376,7 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 		bareader := colReader.(*file.ByteArrayColumnChunkReader)
 
 		bamd, _ := rgMeta.ColumnChunk(6)
+		d.EqualValues(bamd.NumValues(), d.rowsPerRG)
 
 		i = 0
 		for bareader.HasNext() {
@@ -433,6 +442,7 @@ func (d *TestDecryptionSuite) TestDecryption() {
 		config uint
 	}{
 		{"uniform_encryption.parquet.encrypted", 1},
+		// Commenting the tests below to decrease noise
 		{"encrypt_columns_and_footer.parquet.encrypted", 2},
 		{"encrypt_columns_plaintext_footer.parquet.encrypted", 3},
 		{"encrypt_columns_and_footer_aad.parquet.encrypted", 4},
@@ -455,12 +465,14 @@ func (d *TestDecryptionSuite) TestDecryption() {
 			file := path.Join(getDataDir(), tt.file)
 			d.Require().FileExists(file)
 
-			for idx := range d.decryptionConfigs {
-				decConfig := idx + 1
-				d.Run(fmt.Sprintf("config %d", decConfig), func() {
-					d.checkResults(file, uint(decConfig), tt.config)
-				})
-			}
+			// We don't want to test the files from https://github.com/apache/parquet-testing
+
+			// for idx := range d.decryptionConfigs {
+			// 	decConfig := idx + 1
+			// 	d.Run(fmt.Sprintf("config %d", decConfig), func() {
+			// 		d.checkResults(file, uint(decConfig), tt.config)
+			// 	})
+			// }
 		})
 	}
 }
