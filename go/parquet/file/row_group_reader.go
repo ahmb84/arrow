@@ -133,12 +133,29 @@ func (r *RowGroupReader) GetColumnPageReader(i int) (PageReader, error) {
 	columnKeyMeta := cryptoMetadata.GetENCRYPTION_WITH_COLUMN_KEY().KeyMetadata
 	columnPath := cryptoMetadata.GetENCRYPTION_WITH_COLUMN_KEY().PathInSchema
 
-	ctx := CryptoContext{
+	// ctx := CryptoContext{
+	// 	StartDecryptWithDictionaryPage: col.HasDictionaryPage(),
+	// 	RowGroupOrdinal:                r.rgMetadata.Ordinal(),
+	// 	ColumnOrdinal:                  int16(i),
+	// 	MetaDecryptor:                  r.fileDecryptor.GetColumnMetaDecryptor(parquet.ColumnPath(columnPath).String(), string(columnKeyMeta), ""),
+	// 	DataDecryptor:                  r.fileDecryptor.GetColumnDataDecryptor(parquet.ColumnPath(columnPath).String(), string(columnKeyMeta), ""),
+	// }
+	// return NewPageReader(stream, col.NumValues(), col.Compression(), r.props.Allocator(), &ctx)
+	ctx := &CryptoContext{
 		StartDecryptWithDictionaryPage: col.HasDictionaryPage(),
 		RowGroupOrdinal:                r.rgMetadata.Ordinal(),
 		ColumnOrdinal:                  int16(i),
-		MetaDecryptor:                  r.fileDecryptor.GetColumnMetaDecryptor(parquet.ColumnPath(columnPath).String(), string(columnKeyMeta), ""),
-		DataDecryptor:                  r.fileDecryptor.GetColumnDataDecryptor(parquet.ColumnPath(columnPath).String(), string(columnKeyMeta), ""),
+		// MetaDecryptor:                  r.fileDecryptor.GetColumnMetaDecryptor(parquet.ColumnPath(columnPath).String(), string(columnKeyMeta), ""),
+		// DataDecryptor:                  r.fileDecryptor.GetColumnDataDecryptor(parquet.ColumnPath(columnPath).String(), string(columnKeyMeta), ""),
 	}
-	return NewPageReader(stream, col.NumValues(), col.Compression(), r.props.Allocator(), &ctx)
+	metaDecryptor := r.fileDecryptor.GetColumnMetaDecryptor(parquet.ColumnPath(columnPath).String(), string(columnKeyMeta), "")
+	dataDecryptor := r.fileDecryptor.GetColumnDataDecryptor(parquet.ColumnPath(columnPath).String(), string(columnKeyMeta), "")
+	if metaDecryptor != nil {
+		ctx.MetaDecryptor = metaDecryptor
+	}
+	if dataDecryptor != nil {
+		ctx.DataDecryptor = dataDecryptor
+	}
+
+	return NewPageReader(stream, col.NumValues(), col.Compression(), r.props.Allocator(), ctx)
 }

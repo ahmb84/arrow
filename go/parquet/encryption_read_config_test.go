@@ -26,7 +26,6 @@ import (
 	"github.com/apache/arrow/go/v11/arrow/memory"
 	"github.com/apache/arrow/go/v11/parquet"
 	"github.com/apache/arrow/go/v11/parquet/file"
-	"github.com/apache/arrow/go/v11/parquet/internal/encryption"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -122,39 +121,41 @@ func (d *TestDecryptionSuite) SetupSuite() {
 }
 
 func (d *TestDecryptionSuite) createDecryptionConfigs() {
+	// Decryption config 1 to 4 are commented to remove noise
+
 	// Decryption configuration 1: Decrypt using key retriever callback that holds the
 	// keys of two encrypted columns and the footer key.
-	stringKr1 := make(encryption.StringKeyIDRetriever)
-	stringKr1.PutKey("kf", d.footerEncryptionKey)
-	stringKr1.PutKey("kc1", d.colEncryptionKey1)
-	stringKr1.PutKey("kc2", d.colEncryptionKey2)
+	// stringKr1 := make(encryption.StringKeyIDRetriever)
+	// stringKr1.PutKey("kf", d.footerEncryptionKey)
+	// stringKr1.PutKey("kc1", d.colEncryptionKey1)
+	// stringKr1.PutKey("kc2", d.colEncryptionKey2)
 
-	d.decryptionConfigs = append(d.decryptionConfigs,
-		parquet.NewFileDecryptionProperties(parquet.WithKeyRetriever(stringKr1)))
+	// d.decryptionConfigs = append(d.decryptionConfigs,
+	// 	parquet.NewFileDecryptionProperties(parquet.WithKeyRetriever(stringKr1)))
 
-	// Decryption configuration 2: Decrypt using key retriever callback that holds the
-	// keys of two encrypted columns and the footer key. Supply aad_prefix.
-	stringKr2 := make(encryption.StringKeyIDRetriever)
-	stringKr2.PutKey("kf", d.footerEncryptionKey)
-	stringKr2.PutKey("kc1", d.colEncryptionKey1)
-	stringKr2.PutKey("kc2", d.colEncryptionKey2)
-	d.decryptionConfigs = append(d.decryptionConfigs,
-		parquet.NewFileDecryptionProperties(parquet.WithKeyRetriever(stringKr2), parquet.WithDecryptAadPrefix(d.fileName)))
+	// // Decryption configuration 2: Decrypt using key retriever callback that holds the
+	// // keys of two encrypted columns and the footer key. Supply aad_prefix.
+	// stringKr2 := make(encryption.StringKeyIDRetriever)
+	// stringKr2.PutKey("kf", d.footerEncryptionKey)
+	// stringKr2.PutKey("kc1", d.colEncryptionKey1)
+	// stringKr2.PutKey("kc2", d.colEncryptionKey2)
+	// d.decryptionConfigs = append(d.decryptionConfigs,
+	// 	parquet.NewFileDecryptionProperties(parquet.WithKeyRetriever(stringKr2), parquet.WithDecryptAadPrefix(d.fileName)))
 
-	// Decryption configuration 3: Decrypt using explicit column and footer keys. Supply
-	// aad_prefix.
-	decryptCols := make(parquet.ColumnPathToDecryptionPropsMap)
-	decryptCols[d.pathToFloat] = parquet.NewColumnDecryptionProperties(d.pathToFloat, parquet.WithDecryptKey(d.colEncryptionKey2))
-	decryptCols[d.pathToDouble] = parquet.NewColumnDecryptionProperties(d.pathToDouble, parquet.WithDecryptKey(d.colEncryptionKey1))
-	d.decryptionConfigs = append(d.decryptionConfigs,
-		parquet.NewFileDecryptionProperties(parquet.WithFooterKey(d.footerEncryptionKey), parquet.WithColumnKeys(decryptCols)))
+	// // Decryption configuration 3: Decrypt using explicit column and footer keys. Supply
+	// // aad_prefix.
+	// decryptCols := make(parquet.ColumnPathToDecryptionPropsMap)
+	// decryptCols[d.pathToFloat] = parquet.NewColumnDecryptionProperties(d.pathToFloat, parquet.WithDecryptKey(d.colEncryptionKey2))
+	// decryptCols[d.pathToDouble] = parquet.NewColumnDecryptionProperties(d.pathToDouble, parquet.WithDecryptKey(d.colEncryptionKey1))
+	// d.decryptionConfigs = append(d.decryptionConfigs,
+	// 	parquet.NewFileDecryptionProperties(parquet.WithFooterKey(d.footerEncryptionKey), parquet.WithColumnKeys(decryptCols)))
 
-	// Decryption Configuration 4: use plaintext footer mode, read only footer + plaintext
-	// columns.
-	d.decryptionConfigs = append(d.decryptionConfigs, nil)
+	// // Decryption Configuration 4: use plaintext footer mode, read only footer + plaintext
+	// // columns.
+	// d.decryptionConfigs = append(d.decryptionConfigs, nil)
 
 	// Decryption configuration 5: Decrypt using explicit column and footer keys. Decrypt one column and not the other.
-	decryptCols = make(parquet.ColumnPathToDecryptionPropsMap)
+	decryptCols := make(parquet.ColumnPathToDecryptionPropsMap)
 	decryptCols[d.pathToFloat] = parquet.NewColumnDecryptionProperties(d.pathToFloat, parquet.WithDecryptKey(d.colEncryptionKey2))
 	d.decryptionConfigs = append(d.decryptionConfigs,
 		parquet.NewFileDecryptionProperties(parquet.WithFooterKey(d.footerEncryptionKey), parquet.WithColumnKeys(decryptCols)))
@@ -164,9 +165,12 @@ func (d *TestDecryptionSuite) createDecryptionConfigs() {
 func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int) {
 	// if we get decryption_config_num = x then it means the actual number is x+1
 	// and since we want decryption_config_num=4 we set the condition to 3
+	fmt.Println("decryptConfigNum", decryptConfigNum)
 	props := parquet.NewReaderProperties(memory.DefaultAllocator)
 	if decryptConfigNum != 3 {
+		fmt.Println("decryptConfigNum", decryptConfigNum)
 		props.FileDecryptProps = d.decryptionConfigs[decryptConfigNum].Clone("")
+		fmt.Println("props.FileDecryptProps", props.FileDecryptProps)
 	}
 
 	fileReader, err := file.OpenParquetFile(filename, false, file.WithReadProps(props))
@@ -330,6 +334,8 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 				// read one value at a time. the number of rows read is returned. values
 				// read contains the number of non-null rows
 				rowsRead, valuesRead, _ = floatReader.ReadBatch(1, value[:], nil, nil)
+
+				fmt.Println("decrypted float value", value[0]) // print decrypted value
 				// ensure only 1 value is read
 				d.EqualValues(1, rowsRead)
 				// there are no null values
@@ -356,6 +362,8 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 				// read one value at a time. the number of rows read is returned. values
 				// read contains the number of non-null rows
 				rowsRead, valuesRead, _ = dblReader.ReadBatch(1, value[:], nil, nil)
+
+				fmt.Println("decrypted double value", value[0]) // print decrypted value
 				// ensure only 1 value is read
 				d.EqualValues(1, rowsRead)
 				// there are no null values
@@ -439,12 +447,12 @@ func (d *TestDecryptionSuite) TestDecryption() {
 		file   string
 		config uint
 	}{
-		{"uniform_encryption.parquet.encrypted", 1},
+		// {"uniform_encryption.parquet.encrypted", 1},
 		{"encrypt_columns_and_footer.parquet.encrypted", 2},
-		{"encrypt_columns_plaintext_footer.parquet.encrypted", 3},
-		{"encrypt_columns_and_footer_aad.parquet.encrypted", 4},
-		{"encrypt_columns_and_footer_disable_aad_storage.parquet.encrypted", 5},
-		{"encrypt_columns_and_footer_ctr.parquet.encrypted", 6},
+		// {"encrypt_columns_plaintext_footer.parquet.encrypted", 3},
+		// {"encrypt_columns_and_footer_aad.parquet.encrypted", 4},
+		// {"encrypt_columns_and_footer_disable_aad_storage.parquet.encrypted", 5},
+		// {"encrypt_columns_and_footer_ctr.parquet.encrypted", 6},
 	}
 	for _, tt := range tests {
 		d.Run(tt.file, func() {

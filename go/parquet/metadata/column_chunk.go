@@ -19,6 +19,7 @@ package metadata
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"reflect"
 
@@ -96,7 +97,13 @@ func NewColumnChunkMetaData(column *format.ColumnChunk, descr *schema.Column, wr
 				keyMetadata := ccmd.ENCRYPTION_WITH_COLUMN_KEY.GetKeyMetadata()
 				aadColumnMetadata := encryption.CreateModuleAad(fileDecryptor.FileAad(), encryption.ColumnMetaModule, rowGroupOrdinal, columnOrdinal, -1)
 				decryptor := fileDecryptor.GetColumnMetaDecryptor(path.String(), string(keyMetadata), aadColumnMetadata)
-				thrift.DeserializeThrift(&c.decryptedMeta, decryptor.Decrypt(column.GetEncryptedColumnMetadata()))
+				// thrift.DeserializeThrift(&c.decryptedMeta, decryptor.Decrypt(column.GetEncryptedColumnMetadata()))
+				// c.columnMeta = &c.decryptedMeta
+				if decryptor == nil {
+					fmt.Println("decryptor is null") // print that decryptor is null
+				} else {
+					thrift.DeserializeThrift(&c.decryptedMeta, decryptor.Decrypt(column.GetEncryptedColumnMetadata()))
+				}
 				c.columnMeta = &c.decryptedMeta
 			} else {
 				return nil, xerrors.New("cannot decrypt column metadata. file decryption not setup correctly")

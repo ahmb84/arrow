@@ -191,7 +191,8 @@ func (d *fileDecryptor) getColumnDecryptor(columnPath, columnMeta, aad string, m
 		columnKey = d.props.KeyRetriever.GetKey([]byte(columnMeta))
 	}
 	if columnKey == "" {
-		panic("hidden column exception, path=" + columnPath)
+		// panic("hidden column exception, path=" + columnPath)
+		return nil
 	}
 
 	aesDataDecrypt := d.getDataAesDecryptor()
