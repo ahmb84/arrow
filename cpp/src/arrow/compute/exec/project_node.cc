@@ -23,6 +23,7 @@
 #include "arrow/compute/exec/expression.h"
 #include "arrow/compute/exec/map_node.h"
 #include "arrow/compute/exec/options.h"
+#include "arrow/compute/exec/query_context.h"
 #include "arrow/compute/exec/util.h"
 #include "arrow/datum.h"
 #include "arrow/result.h"
@@ -38,7 +39,7 @@ using internal::checked_cast;
 namespace compute {
 namespace {
 
-class ProjectNode : public MapNode {
+class ProjectNode : public MapNode, public TracedNode<ProjectNode> {
  public:
   ProjectNode(ExecPlan* plan, std::vector<ExecNode*> inputs,
               std::shared_ptr<Schema> output_schema, std::vector<Expression> exprs)
@@ -64,8 +65,8 @@ class ProjectNode : public MapNode {
     int i = 0;
     for (auto& expr : exprs) {
       if (!expr.IsBound()) {
-        ARROW_ASSIGN_OR_RAISE(
-            expr, expr.Bind(*inputs[0]->output_schema(), plan->exec_context()));
+        ARROW_ASSIGN_OR_RAISE(expr, expr.Bind(*inputs[0]->output_schema(),
+                                              plan->query_context()->exec_context()));
       }
       fields[i] = field(std::move(names[i]), expr.type()->GetSharedPtr());
       ++i;
@@ -76,38 +77,22 @@ class ProjectNode : public MapNode {
 
   const char* kind_name() const override { return "ProjectNode"; }
 
-  Result<ExecBatch> DoProject(const ExecBatch& target) {
+  Result<ExecBatch> ProcessBatch(ExecBatch batch) override {
     std::vector<Datum> values{exprs_.size()};
     for (size_t i = 0; i < exprs_.size(); ++i) {
       util::tracing::Span span;
       START_COMPUTE_SPAN(span, "Project",
                          {{"project.type", exprs_[i].type()->ToString()},
-                          {"project.length", target.length},
+                          {"project.length", batch.length},
                           {"project.expression", exprs_[i].ToString()}});
       ARROW_ASSIGN_OR_RAISE(Expression simplified_expr,
-                            SimplifyWithGuarantee(exprs_[i], target.guarantee));
+                            SimplifyWithGuarantee(exprs_[i], batch.guarantee));
 
-      ARROW_ASSIGN_OR_RAISE(values[i], ExecuteScalarExpression(simplified_expr, target,
-                                                               plan()->exec_context()));
+      ARROW_ASSIGN_OR_RAISE(
+          values[i], ExecuteScalarExpression(simplified_expr, batch,
+                                             plan()->query_context()->exec_context()));
     }
-    return ExecBatch{std::move(values), target.length};
-  }
-
-  void InputReceived(ExecNode* input, ExecBatch batch) override {
-    EVENT(span_, "InputReceived", {{"batch.length", batch.length}});
-    DCHECK_EQ(input, inputs_[0]);
-    auto func = [this](ExecBatch batch) {
-      util::tracing::Span span;
-      START_COMPUTE_SPAN_WITH_PARENT(span, span_, "InputReceived",
-                                     {{"project", ToStringExtra()},
-                                      {"node.label", label()},
-                                      {"batch.length", batch.length}});
-      auto result = DoProject(std::move(batch));
-      MARK_SPAN(span, result.status());
-      END_SPAN(span);
-      return result;
-    };
-    this->SubmitTask(std::move(func), std::move(batch));
+    return ExecBatch{std::move(values), batch.length};
   }
 
  protected:

@@ -98,6 +98,7 @@ type TestDecryptionSuite struct {
 	colEncryptionKey1   string
 	colEncryptionKey2   string
 	fileName            string
+	rowsPerRG           int
 }
 
 func (d *TestDecryptionSuite) TearDownSuite() {
@@ -116,6 +117,7 @@ func (d *TestDecryptionSuite) SetupSuite() {
 	d.colEncryptionKey1 = ColumnEncryptionKey1
 	d.colEncryptionKey2 = ColumnEncryptionKey2
 	d.fileName = FileName
+	d.rowsPerRG = 50 // same as write encryption test
 
 	d.createDecryptionConfigs()
 }
@@ -191,6 +193,7 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 
 		// get rowgroup meta
 		rgMeta := fileMetadata.RowGroup(r)
+		d.EqualValues(d.rowsPerRG, rgMeta.NumRows())
 
 		valuesRead := 0
 		rowsRead := int64(0)
@@ -204,6 +207,7 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 
 		// get column chunk metadata for boolean column
 		boolMd, _ := rgMeta.ColumnChunk(0)
+		d.EqualValues(d.rowsPerRG, boolMd.NumValues())
 
 		// Read all rows in column
 		i := 0
@@ -231,6 +235,7 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 		int32reader := colReader.(*file.Int32ColumnChunkReader)
 
 		int32md, _ := rgMeta.ColumnChunk(1)
+		d.EqualValues(d.rowsPerRG, int32md.NumValues())
 		// Read all rows in column
 		i = 0
 		for int32reader.HasNext() {
@@ -256,6 +261,8 @@ func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int)
 		int64reader := colReader.(*file.Int64ColumnChunkReader)
 
 		int64md, _ := rgMeta.ColumnChunk(2)
+		// repeated column, we should have 2*d.rowsPerRG values
+		d.EqualValues(2*d.rowsPerRG, int64md.NumValues())
 		// Read all rows in column
 		i = 0
 		for int64reader.HasNext() {

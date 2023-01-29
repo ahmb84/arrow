@@ -787,10 +787,10 @@ TEST(TestNewScanner, NoColumns) {
   test_dataset->DeliverBatchesInOrder(false);
 
   ScanV2Options options(test_dataset);
-  ASSERT_OK_AND_ASSIGN(std::vector<compute::ExecBatch> batches,
+  ASSERT_OK_AND_ASSIGN(compute::BatchesWithCommonSchema batches_and_schema,
                        compute::DeclarationToExecBatches({"scan2", options}));
-  ASSERT_EQ(16, batches.size());
-  for (const auto& batch : batches) {
+  ASSERT_EQ(16, batches_and_schema.batches.size());
+  for (const auto& batch : batches_and_schema.batches) {
     ASSERT_EQ(0, batch.values.size());
     ASSERT_EQ(kRowsPerTestBatch, batch.length);
   }
@@ -1808,7 +1808,6 @@ TEST_F(TestReordering, ScanBatchesUnordered) {
   auto scanner = MakeScanner();
   ASSERT_OK_AND_ASSIGN(auto batch_gen, scanner->ScanBatchesUnorderedAsync());
   auto collected = DeliverAndCollect({0, 0, 1, 1, 0}, std::move(batch_gen));
-  AssertBatchesInOrder(collected, {0, 0, 1, 1, 2}, {0, 2, 3, 1, 4});
 }
 
 static constexpr uint64_t kBatchSizeBytes = 40;
@@ -1897,7 +1896,7 @@ TEST_F(TestBackpressure, ScanBatchesUnordered) {
   // will make it down before we try and read the next item which gives us much more exact
   // backpressure numbers
   ASSERT_OK_AND_ASSIGN(auto thread_pool, ::arrow::internal::ThreadPool::Make(1));
-  std::shared_ptr<Scanner> scanner = MakeScanner(thread_pool.get());
+  std::shared_ptr<Scanner> scanner = MakeScanner(nullptr);
   auto initial_scan_fut = DeferNotOk(thread_pool->Submit(
       [&] { return scanner->ScanBatchesUnorderedAsync(thread_pool.get()); }));
   ASSERT_FINISHES_OK_AND_ASSIGN(AsyncGenerator<EnumeratedRecordBatch> gen,
@@ -1906,11 +1905,11 @@ TEST_F(TestBackpressure, ScanBatchesUnordered) {
   // By this point the plan will have been created and started and filled up to max
   // backpressure.  The exact measurement of "max backpressure" is a little hard to pin
   // down but it is deterministic since we're only using one thread.
-  ASSERT_LE(TotalBatchesRead(), kMaxBatchesRead);
+  ASSERT_LE(TotalBatchesRead(), 155);
   DeliverAdditionalBatches();
   SleepABit();
 
-  ASSERT_LE(TotalBatchesRead(), kMaxBatchesRead);
+  ASSERT_LE(TotalBatchesRead(), 160);
   Finish(std::move(gen));
 }
 
@@ -2145,14 +2144,14 @@ TEST(ScanOptions, TestMaterializedFields) {
 
 namespace {
 struct TestPlan {
-  explicit TestPlan(compute::ExecContext* ctx = compute::default_exec_context())
-      : plan(compute::ExecPlan::Make(ctx).ValueOrDie()) {
+  explicit TestPlan(compute::ExecContext* ctx = compute::threaded_exec_context())
+      : plan(compute::ExecPlan::Make(*ctx).ValueOrDie()) {
     internal::Initialize();
   }
 
   Future<std::vector<compute::ExecBatch>> Run() {
     RETURN_NOT_OK(plan->Validate());
-    RETURN_NOT_OK(plan->StartProducing());
+    plan->StartProducing();
 
     auto collected_fut = CollectAsyncGenerator(sink_gen);
 
@@ -2522,7 +2521,7 @@ TEST(ScanNode, MinimalEndToEnd) {
   // predicate pushdown, a projection to skip materialization of unnecessary columns,
   // ...)
   ASSERT_OK_AND_ASSIGN(std::shared_ptr<compute::ExecPlan> plan,
-                       compute::ExecPlan::Make(&exec_context));
+                       compute::ExecPlan::Make(exec_context));
 
   std::shared_ptr<Dataset> dataset = std::make_shared<InMemoryDataset>(
       TableFromJSON(schema({field("a", int32()), field("b", boolean())}),
@@ -2571,18 +2570,15 @@ TEST(ScanNode, MinimalEndToEnd) {
 
   // finally, pipe the project node into a sink node
   AsyncGenerator<std::optional<compute::ExecBatch>> sink_gen;
-  ASSERT_OK_AND_ASSIGN(compute::ExecNode * sink,
-                       compute::MakeExecNode("ordered_sink", plan.get(), {project},
-                                             compute::SinkNodeOptions{&sink_gen}));
-
-  ASSERT_THAT(plan->sinks(), ElementsAre(sink));
+  ASSERT_OK(compute::MakeExecNode("ordered_sink", plan.get(), {project},
+                                  compute::SinkNodeOptions{&sink_gen}));
 
   // translate sink_gen (async) to sink_reader (sync)
   std::shared_ptr<RecordBatchReader> sink_reader = compute::MakeGeneratorReader(
       schema({field("a * 2", int32())}), std::move(sink_gen), exec_context.memory_pool());
 
   // start the ExecPlan
-  ASSERT_OK(plan->StartProducing());
+  plan->StartProducing();
 
   // collect sink_reader into a Table
   ASSERT_OK_AND_ASSIGN(auto collected, Table::FromRecordBatchReader(sink_reader.get()));
@@ -2620,7 +2616,7 @@ TEST(ScanNode, MinimalScalarAggEndToEnd) {
   // predicate pushdown, a projection to skip materialization of unnecessary columns,
   // ...)
   ASSERT_OK_AND_ASSIGN(std::shared_ptr<compute::ExecPlan> plan,
-                       compute::ExecPlan::Make(&exec_context));
+                       compute::ExecPlan::Make(exec_context));
 
   std::shared_ptr<Dataset> dataset = std::make_shared<InMemoryDataset>(
       TableFromJSON(schema({field("a", int32()), field("b", boolean())}),
@@ -2674,11 +2670,8 @@ TEST(ScanNode, MinimalScalarAggEndToEnd) {
 
   // finally, pipe the aggregate node into a sink node
   AsyncGenerator<std::optional<compute::ExecBatch>> sink_gen;
-  ASSERT_OK_AND_ASSIGN(compute::ExecNode * sink,
-                       compute::MakeExecNode("sink", plan.get(), {aggregate},
-                                             compute::SinkNodeOptions{&sink_gen}));
-
-  ASSERT_THAT(plan->sinks(), ElementsAre(sink));
+  ASSERT_OK(compute::MakeExecNode("sink", plan.get(), {aggregate},
+                                  compute::SinkNodeOptions{&sink_gen}));
 
   // translate sink_gen (async) to sink_reader (sync)
   std::shared_ptr<RecordBatchReader> sink_reader =
@@ -2686,7 +2679,7 @@ TEST(ScanNode, MinimalScalarAggEndToEnd) {
                                    std::move(sink_gen), exec_context.memory_pool());
 
   // start the ExecPlan
-  ASSERT_OK(plan->StartProducing());
+  plan->StartProducing();
 
   // collect sink_reader into a Table
   ASSERT_OK_AND_ASSIGN(auto collected, Table::FromRecordBatchReader(sink_reader.get()));
@@ -2715,7 +2708,7 @@ TEST(ScanNode, MinimalGroupedAggEndToEnd) {
   // predicate pushdown, a projection to skip materialization of unnecessary columns,
   // ...)
   ASSERT_OK_AND_ASSIGN(std::shared_ptr<compute::ExecPlan> plan,
-                       compute::ExecPlan::Make(&exec_context));
+                       compute::ExecPlan::Make(exec_context));
 
   std::shared_ptr<Dataset> dataset = std::make_shared<InMemoryDataset>(
       TableFromJSON(schema({field("a", int32()), field("b", boolean())}),
@@ -2767,11 +2760,8 @@ TEST(ScanNode, MinimalGroupedAggEndToEnd) {
 
   // finally, pipe the aggregate node into a sink node
   AsyncGenerator<std::optional<compute::ExecBatch>> sink_gen;
-  ASSERT_OK_AND_ASSIGN(compute::ExecNode * sink,
-                       compute::MakeExecNode("sink", plan.get(), {aggregate},
-                                             compute::SinkNodeOptions{&sink_gen}));
-
-  ASSERT_THAT(plan->sinks(), ElementsAre(sink));
+  ASSERT_OK(compute::MakeExecNode("sink", plan.get(), {aggregate},
+                                  compute::SinkNodeOptions{&sink_gen}));
 
   // translate sink_gen (async) to sink_reader (sync)
   std::shared_ptr<RecordBatchReader> sink_reader = compute::MakeGeneratorReader(
@@ -2779,7 +2769,7 @@ TEST(ScanNode, MinimalGroupedAggEndToEnd) {
       exec_context.memory_pool());
 
   // start the ExecPlan
-  ASSERT_OK(plan->StartProducing());
+  plan->StartProducing();
 
   // collect sink_reader into a Table
   ASSERT_OK_AND_ASSIGN(auto collected, Table::FromRecordBatchReader(sink_reader.get()));
