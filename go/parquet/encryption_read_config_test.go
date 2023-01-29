@@ -152,6 +152,13 @@ func (d *TestDecryptionSuite) createDecryptionConfigs() {
 	// Decryption Configuration 4: use plaintext footer mode, read only footer + plaintext
 	// columns.
 	d.decryptionConfigs = append(d.decryptionConfigs, nil)
+
+	// Decryption configuration 5: Decrypt using explicit column and footer keys. Decrypt one column and not the other.
+	decryptCols = make(parquet.ColumnPathToDecryptionPropsMap)
+	decryptCols[d.pathToFloat] = parquet.NewColumnDecryptionProperties(d.pathToFloat, parquet.WithDecryptKey(d.colEncryptionKey2))
+	d.decryptionConfigs = append(d.decryptionConfigs,
+		parquet.NewFileDecryptionProperties(parquet.WithFooterKey(d.footerEncryptionKey), parquet.WithColumnKeys(decryptCols)))
+
 }
 
 func (d *TestDecryptionSuite) decryptFile(filename string, decryptConfigNum int) {
