@@ -124,13 +124,13 @@ Result<Datum> NaiveGroupBy(std::vector<Datum> arguments, std::vector<Datum> keys
 Result<Datum> GroupByUsingExecPlan(const BatchesWithSchema& input,
                                    const std::vector<std::string>& key_names,
                                    const std::vector<Aggregate>& aggregates,
-                                   bool use_threads, ExecContext* ctx) {
+                                   bool use_threads) {
   std::vector<FieldRef> keys(key_names.size());
   for (size_t i = 0; i < key_names.size(); ++i) {
     keys[i] = FieldRef(key_names[i]);
   }
 
-  ARROW_ASSIGN_OR_RAISE(auto plan, ExecPlan::Make(ctx));
+  ARROW_ASSIGN_OR_RAISE(auto plan, ExecPlan::Make(*threaded_exec_context()));
   AsyncGenerator<std::optional<ExecBatch>> sink_gen;
   RETURN_NOT_OK(
       Declaration::Sequence(
@@ -143,7 +143,7 @@ Result<Datum> GroupByUsingExecPlan(const BatchesWithSchema& input,
           .AddToPlan(plan.get()));
 
   RETURN_NOT_OK(plan->Validate());
-  RETURN_NOT_OK(plan->StartProducing());
+  plan->StartProducing();
 
   auto collected_fut = CollectAsyncGenerator(sink_gen);
 
@@ -162,7 +162,7 @@ Result<Datum> GroupByUsingExecPlan(const BatchesWithSchema& input,
                         start_and_collect.MoveResult());
 
   ArrayVector out_arrays(aggregates.size() + key_names.size());
-  const auto& output_schema = plan->sources()[0]->outputs()[0]->output_schema();
+  const auto& output_schema = plan->nodes()[0]->output()->output_schema();
   for (size_t i = 0; i < out_arrays.size(); ++i) {
     std::vector<std::shared_ptr<Array>> arrays(output_batches.size());
     for (size_t j = 0; j < output_batches.size(); ++j) {
@@ -178,14 +178,37 @@ Result<Datum> GroupByUsingExecPlan(const BatchesWithSchema& input,
     }
   }
 
-  return StructArray::Make(std::move(out_arrays), output_schema->fields());
+  // The exec plan may reorder the output rows.  The tests are all setup to expect ouptut
+  // in ascending order of keys.  So we need to sort the result by the key columns.  To do
+  // that we create a table using the key columns, calculate the sort indices from that
+  // table (sorting on all fields) and then use those indices to calculate our result.
+  std::vector<std::shared_ptr<Field>> key_fields;
+  std::vector<std::shared_ptr<Array>> key_columns;
+  std::vector<SortKey> sort_keys;
+  for (std::size_t i = 0; i < key_names.size(); i++) {
+    const std::shared_ptr<Array>& arr = out_arrays[i + aggregates.size()];
+    key_columns.push_back(arr);
+    key_fields.push_back(field("name_does_not_matter", arr->type()));
+    sort_keys.emplace_back(static_cast<int>(i));
+  }
+  std::shared_ptr<Schema> key_schema = schema(std::move(key_fields));
+  std::shared_ptr<Table> key_table = Table::Make(std::move(key_schema), key_columns);
+  SortOptions sort_options(std::move(sort_keys));
+  ARROW_ASSIGN_OR_RAISE(std::shared_ptr<Array> sort_indices,
+                        SortIndices(key_table, sort_options));
+
+  ARROW_ASSIGN_OR_RAISE(
+      std::shared_ptr<Array> struct_arr,
+      StructArray::Make(std::move(out_arrays), output_schema->fields()));
+
+  return Take(struct_arr, sort_indices);
 }
 
 /// Simpler overload where you can give the columns as datums
 Result<Datum> GroupByUsingExecPlan(const std::vector<Datum>& arguments,
                                    const std::vector<Datum>& keys,
                                    const std::vector<Aggregate>& aggregates,
-                                   bool use_threads, ExecContext* ctx) {
+                                   bool use_threads) {
   using arrow::compute::detail::ExecSpanIterator;
 
   FieldVector scan_fields(arguments.size() + keys.size());
@@ -206,7 +229,7 @@ Result<Datum> GroupByUsingExecPlan(const std::vector<Datum>& arguments,
 
   ExecSpanIterator span_iterator;
   ARROW_ASSIGN_OR_RAISE(auto batch, ExecBatch::Make(inputs));
-  RETURN_NOT_OK(span_iterator.Init(batch, ctx->exec_chunksize()));
+  RETURN_NOT_OK(span_iterator.Init(batch));
   BatchesWithSchema input;
   input.schema = schema(std::move(scan_fields));
   ExecSpan span;
@@ -215,7 +238,7 @@ Result<Datum> GroupByUsingExecPlan(const std::vector<Datum>& arguments,
     input.batches.push_back(span.ToExecBatch());
   }
 
-  return GroupByUsingExecPlan(input, key_names, aggregates, use_threads, ctx);
+  return GroupByUsingExecPlan(input, key_names, aggregates, use_threads);
 }
 
 void ValidateGroupBy(const std::vector<Aggregate>& aggregates,
@@ -255,8 +278,7 @@ Result<Datum> GroupByTest(const std::vector<Datum>& arguments,
     idx = idx + 1;
   }
   if (use_exec_plan) {
-    return GroupByUsingExecPlan(arguments, keys, internal_aggregates, use_threads,
-                                small_chunksize_context(use_threads));
+    return GroupByUsingExecPlan(arguments, keys, internal_aggregates, use_threads);
   } else {
     return internal::GroupBy(arguments, keys, internal_aggregates, use_threads,
                              default_exec_context());
@@ -882,7 +904,7 @@ TEST(GroupBy, CountScalar) {
                                  {"hash_count", keep_nulls, "argument", "hash_count"},
                                  {"hash_count", count_all, "argument", "hash_count"},
                              },
-                             use_threads, default_exec_context()));
+                             use_threads));
     Datum expected = ArrayFromJSON(struct_({
                                        field("hash_count", int64()),
                                        field("hash_count", int64()),
@@ -1095,7 +1117,7 @@ TEST(GroupBy, SumMeanProductScalar) {
                                  {"hash_mean", nullptr, "argument", "hash_mean"},
                                  {"hash_product", nullptr, "argument", "hash_product"},
                              },
-                             use_threads, default_exec_context()));
+                             use_threads));
     Datum expected = ArrayFromJSON(struct_({
                                        field("hash_sum", int64()),
                                        field("hash_mean", float64()),
@@ -1492,7 +1514,7 @@ TEST(GroupBy, StddevVarianceTDigestScalar) {
                                  {"hash_variance", nullptr, "argument1", "hash_variance"},
                                  {"hash_tdigest", nullptr, "argument1", "hash_tdigest"},
                              },
-                             use_threads, default_exec_context()));
+                             use_threads));
     Datum expected =
         ArrayFromJSON(struct_({
                           field("hash_stddev", float64()),
@@ -1554,7 +1576,7 @@ TEST(GroupBy, VarianceOptions) {
                 {"hash_variance", min_count, "argument", "hash_variance"},
                 {"hash_variance", keep_nulls_min_count, "argument", "hash_variance"},
             },
-            use_threads, default_exec_context()));
+            use_threads));
     Datum expected = ArrayFromJSON(struct_({
                                        field("hash_stddev", float64()),
                                        field("hash_stddev", float64()),
@@ -1585,7 +1607,7 @@ TEST(GroupBy, VarianceOptions) {
                 {"hash_variance", min_count, "argument1", "hash_variance"},
                 {"hash_variance", keep_nulls_min_count, "argument1", "hash_variance"},
             },
-            use_threads, default_exec_context()));
+            use_threads));
     expected = ArrayFromJSON(struct_({
                                  field("hash_stddev", float64()),
                                  field("hash_stddev", float64()),
@@ -2014,7 +2036,7 @@ TEST(GroupBy, MinMaxScalar) {
         Datum actual,
         GroupByUsingExecPlan(input, {"key"},
                              {{"hash_min_max", nullptr, "argument", "hash_min_max"}},
-                             use_threads, default_exec_context()));
+                             use_threads));
     Datum expected =
         ArrayFromJSON(struct_({
                           field("hash_min_max",
@@ -2144,7 +2166,7 @@ TEST(GroupBy, AnyAllScalar) {
                                  {"hash_any", keep_nulls, "argument", "hash_any"},
                                  {"hash_all", keep_nulls, "argument", "hash_all"},
                              },
-                             use_threads, default_exec_context()));
+                             use_threads));
     Datum expected = ArrayFromJSON(struct_({
                                        field("hash_any", boolean()),
                                        field("hash_all", boolean()),
@@ -2765,7 +2787,7 @@ TEST(GroupBy, OneScalar) {
     ASSERT_OK_AND_ASSIGN(
         Datum actual, GroupByUsingExecPlan(
                           input, {"key"}, {{"hash_one", nullptr, "argument", "hash_one"}},
-                          use_threads, default_exec_context()));
+                          use_threads));
 
     const auto& struct_arr = actual.array_as<StructArray>();
     //  Check the key column
@@ -3237,10 +3259,10 @@ TEST(GroupBy, CountAndSum) {
     [null,  3]
   ])");
 
-  std::shared_ptr<CountOptions> count_options;
-  auto count_nulls = std::make_shared<CountOptions>(CountOptions::ONLY_NULL);
-  auto count_all = std::make_shared<CountOptions>(CountOptions::ALL);
-  auto min_count =
+  std::shared_ptr<CountOptions> count_opts;
+  auto count_nulls_opts = std::make_shared<CountOptions>(CountOptions::ONLY_NULL);
+  auto count_all_opts = std::make_shared<CountOptions>(CountOptions::ALL);
+  auto min_count_opts =
       std::make_shared<ScalarAggregateOptions>(/*skip_nulls=*/true, /*min_count=*/3);
   ASSERT_OK_AND_ASSIGN(
       Datum aggregated_and_grouped,
@@ -3258,12 +3280,13 @@ TEST(GroupBy, CountAndSum) {
               batch->GetColumnByName("key"),
           },
           {
-              {"hash_count", count_options, "agg_0", "hash_count"},
-              {"hash_count", count_nulls, "agg_1", "hash_count"},
-              {"hash_count", count_all, "agg_2", "hash_count"},
-              {"hash_sum", nullptr, "agg_3", "hash_sum"},
-              {"hash_sum", min_count, "agg_4", "hash_sum"},
-              {"hash_sum", nullptr, "agg_5", "hash_sum"},
+              {"hash_count", count_opts, "agg_0", "hash_count"},
+              {"hash_count", count_nulls_opts, "agg_1", "hash_count"},
+              {"hash_count", count_all_opts, "agg_2", "hash_count"},
+              {"hash_count_all", "hash_count_all"},
+              {"hash_sum", "agg_3", "hash_sum"},
+              {"hash_sum", min_count_opts, "agg_4", "hash_sum"},
+              {"hash_sum", "agg_5", "hash_sum"},
           }));
 
   AssertDatumsEqual(
@@ -3271,6 +3294,7 @@ TEST(GroupBy, CountAndSum) {
                         field("hash_count", int64()),
                         field("hash_count", int64()),
                         field("hash_count", int64()),
+                        field("hash_count_all", int64()),
                         // NB: summing a float32 array results in float64 sums
                         field("hash_sum", float64()),
                         field("hash_sum", float64()),
@@ -3278,13 +3302,54 @@ TEST(GroupBy, CountAndSum) {
                         field("key_0", int64()),
                     }),
                     R"([
-    [2, 1, 3, 4.25,   null,   3,    1],
-    [3, 0, 3, -0.125, -0.125, 6,    2],
-    [0, 2, 2, null,   null,   6,    3],
-    [2, 0, 2, 4.75,   null,   null, null]
+    [2, 1, 3, 3, 4.25,   null,   3,    1],
+    [3, 0, 3, 3, -0.125, -0.125, 6,    2],
+    [0, 2, 2, 2, null,   null,   6,    3],
+    [2, 0, 2, 2, 4.75,   null,   null, null]
   ])"),
       aggregated_and_grouped,
       /*verbose=*/true);
+}
+
+TEST(GroupBy, StandAloneNullaryCount) {
+  auto batch = RecordBatchFromJSON(
+      schema({field("argument", float64()), field("key", int64())}), R"([
+    [1.0,   1],
+    [null,  1],
+    [0.0,   2],
+    [null,  3],
+    [4.0,   null],
+    [3.25,  1],
+    [0.125, 2],
+    [-0.25, 2],
+    [0.75,  null],
+    [null,  3]
+  ])");
+
+  ASSERT_OK_AND_ASSIGN(Datum aggregated_and_grouped,
+                       internal::GroupBy(
+                           // zero arguments for aggregations because only the
+                           // nullary hash_count_all aggregation is present
+                           {},
+                           {
+                               batch->GetColumnByName("key"),
+                           },
+                           {
+                               {"hash_count_all", "hash_count_all"},
+                           }));
+
+  AssertDatumsEqual(ArrayFromJSON(struct_({
+                                      field("hash_count_all", int64()),
+                                      field("key_0", int64()),
+                                  }),
+                                  R"([
+    [3, 1],
+    [3, 2],
+    [2, 3],
+    [2, null]
+  ])"),
+                    aggregated_and_grouped,
+                    /*verbose=*/true);
 }
 
 TEST(GroupBy, Product) {

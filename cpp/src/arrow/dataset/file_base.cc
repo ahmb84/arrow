@@ -29,7 +29,9 @@
 #include "arrow/compute/api_scalar.h"
 #include "arrow/compute/exec/forest_internal.h"
 #include "arrow/compute/exec/map_node.h"
+#include "arrow/compute/exec/query_context.h"
 #include "arrow/compute/exec/subtree_internal.h"
+#include "arrow/compute/exec/util.h"
 #include "arrow/dataset/dataset_internal.h"
 #include "arrow/dataset/dataset_writer.h"
 #include "arrow/dataset/scanner.h"
@@ -401,7 +403,7 @@ class DatasetWritingSinkNodeConsumer : public compute::SinkNodeConsumer {
     ARROW_ASSIGN_OR_RAISE(
         dataset_writer_,
         internal::DatasetWriter::Make(
-            write_options_, plan->async_scheduler(),
+            write_options_, plan->query_context()->async_scheduler(),
             [backpressure_control] { backpressure_control->Pause(); },
             [backpressure_control] { backpressure_control->Resume(); }, [] {}));
     return Status::OK();
@@ -443,14 +445,6 @@ class DatasetWritingSinkNodeConsumer : public compute::SinkNodeConsumer {
 
 Status FileSystemDataset::Write(const FileSystemDatasetWriteOptions& write_options,
                                 std::shared_ptr<Scanner> scanner) {
-  const io::IOContext& io_context = scanner->options()->io_context;
-  auto cpu_executor =
-      scanner->options()->use_threads ? ::arrow::internal::GetCpuThreadPool() : nullptr;
-  std::shared_ptr<compute::ExecContext> exec_context =
-      std::make_shared<compute::ExecContext>(io_context.pool(), cpu_executor);
-
-  ARROW_ASSIGN_OR_RAISE(auto plan, compute::ExecPlan::Make(exec_context.get()));
-
   auto exprs = scanner->options()->projection.call()->arguments;
   auto names = checked_cast<const compute::MakeStructOptions*>(
                    scanner->options()->projection.call()->options.get())
@@ -461,19 +455,14 @@ Status FileSystemDataset::Write(const FileSystemDatasetWriteOptions& write_optio
   // when reading from a single input file.
   const auto& custom_metadata = scanner->options()->projected_schema->metadata();
 
-  RETURN_NOT_OK(
-      compute::Declaration::Sequence(
-          {
-              {"scan", ScanNodeOptions{dataset, scanner->options()}},
-              {"filter", compute::FilterNodeOptions{scanner->options()->filter}},
-              {"project",
-               compute::ProjectNodeOptions{std::move(exprs), std::move(names)}},
-              {"write", WriteNodeOptions{write_options, custom_metadata}},
-          })
-          .AddToPlan(plan.get()));
+  compute::Declaration plan = compute::Declaration::Sequence({
+      {"scan", ScanNodeOptions{dataset, scanner->options()}},
+      {"filter", compute::FilterNodeOptions{scanner->options()->filter}},
+      {"project", compute::ProjectNodeOptions{std::move(exprs), std::move(names)}},
+      {"write", WriteNodeOptions{write_options, custom_metadata}},
+  });
 
-  RETURN_NOT_OK(plan->StartProducing());
-  return plan->finished().status();
+  return compute::DeclarationToStatus(std::move(plan), scanner->options()->use_threads);
 }
 
 Result<compute::ExecNode*> MakeWriteNode(compute::ExecPlan* plan,
@@ -516,10 +505,11 @@ class TeeNode : public compute::MapNode {
         write_options_(std::move(write_options)) {}
 
   Status StartProducing() override {
-    ARROW_ASSIGN_OR_RAISE(dataset_writer_, internal::DatasetWriter::Make(
-                                               write_options_, plan_->async_scheduler(),
-                                               [this] { Pause(); }, [this] { Resume(); },
-                                               [this] { MapNode::Finish(); }));
+    ARROW_ASSIGN_OR_RAISE(
+        dataset_writer_,
+        internal::DatasetWriter::Make(
+            write_options_, plan_->query_context()->async_scheduler(),
+            [this] { Pause(); }, [this] { Resume(); }, [this] { MapNode::Finish(); }));
     return MapNode::StartProducing();
   }
 
@@ -539,15 +529,9 @@ class TeeNode : public compute::MapNode {
 
   const char* kind_name() const override { return "TeeNode"; }
 
-  void Finish(Status finish_st) override {
-    if (!finish_st.ok()) {
-      MapNode::Finish(std::move(finish_st));
-      return;
-    }
-    dataset_writer_->Finish();
-  }
+  void Finish() override { dataset_writer_->Finish(); }
 
-  Result<compute::ExecBatch> DoTee(const compute::ExecBatch& batch) {
+  Result<compute::ExecBatch> ProcessBatch(compute::ExecBatch batch) override {
     ARROW_ASSIGN_OR_RAISE(std::shared_ptr<RecordBatch> record_batch,
                           batch.ToRecordBatch(output_schema()));
     ARROW_RETURN_NOT_OK(WriteNextBatch(std::move(record_batch), batch.guarantee));
@@ -559,28 +543,10 @@ class TeeNode : public compute::MapNode {
     return WriteBatch(batch, guarantee, write_options_,
                       [this](std::shared_ptr<RecordBatch> next_batch,
                              const PartitionPathFormat& destination) {
-                        util::tracing::Span span;
                         dataset_writer_->WriteRecordBatch(
                             next_batch, destination.directory, destination.filename);
                         return Status::OK();
                       });
-  }
-
-  void InputReceived(compute::ExecNode* input, compute::ExecBatch batch) override {
-    EVENT(span_, "InputReceived", {{"batch.length", batch.length}});
-    DCHECK_EQ(input, inputs_[0]);
-    auto func = [this](compute::ExecBatch batch) {
-      util::tracing::Span span;
-      START_SPAN_WITH_PARENT(span, span_, "InputReceived",
-                             {{"tee", ToStringExtra()},
-                              {"node.label", label()},
-                              {"batch.length", batch.length}});
-      auto result = DoTee(std::move(batch));
-      MARK_SPAN(span, result.status());
-      END_SPAN(span);
-      return result;
-    };
-    this->SubmitTask(std::move(func), std::move(batch));
   }
 
   void Pause() { inputs_[0]->PauseProducing(this, ++backpressure_counter_); }

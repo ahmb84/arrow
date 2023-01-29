@@ -24,6 +24,7 @@
 
 #include "arrow/compute/exec/exec_plan.h"
 #include "arrow/compute/exec/expression.h"
+#include "arrow/compute/exec/query_context.h"
 #include "arrow/compute/exec/util.h"
 #include "arrow/dataset/scanner.h"
 #include "arrow/record_batch.h"
@@ -32,8 +33,11 @@
 #include "arrow/type.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/logging.h"
+#include "arrow/util/string.h"
 #include "arrow/util/tracing_internal.h"
 #include "arrow/util/unreachable.h"
+
+using namespace std::string_view_literals;  // NOLINT
 
 namespace cp = arrow::compute;
 
@@ -110,13 +114,11 @@ Future<AsyncGenerator<std::shared_ptr<Fragment>>> GetFragments(Dataset* dataset,
 /// fragments.  On destruction we continue consuming the fragments until they complete
 /// (which should be fairly quick since we cancelled the fragment).  This ensures the
 /// I/O work is completely finished before the node is destroyed.
-class ScanNode : public cp::ExecNode {
+class ScanNode : public cp::ExecNode, public cp::TracedNode<ScanNode> {
  public:
   ScanNode(cp::ExecPlan* plan, ScanV2Options options,
            std::shared_ptr<Schema> output_schema)
-      : cp::ExecNode(plan, {}, {}, std::move(output_schema),
-                     /*num_outputs=*/1),
-        options_(options) {}
+      : cp::ExecNode(plan, {}, {}, std::move(output_schema)), options_(options) {}
 
   static Result<ScanV2Options> NormalizeAndValidate(const ScanV2Options& options,
                                                     compute::ExecContext* ctx) {
@@ -163,8 +165,9 @@ class ScanNode : public cp::ExecNode {
                                     const cp::ExecNodeOptions& options) {
     RETURN_NOT_OK(ValidateExecNodeInputs(plan, inputs, 0, "ScanNode"));
     const auto& scan_options = checked_cast<const ScanV2Options&>(options);
-    ARROW_ASSIGN_OR_RAISE(ScanV2Options normalized_options,
-                          NormalizeAndValidate(scan_options, plan->exec_context()));
+    ARROW_ASSIGN_OR_RAISE(
+        ScanV2Options normalized_options,
+        NormalizeAndValidate(scan_options, plan->query_context()->exec_context()));
     ARROW_ASSIGN_OR_RAISE(std::shared_ptr<Schema> output_schema,
                           OutputSchemaFromOptions(normalized_options));
     return plan->EmplaceNode<ScanNode>(plan, std::move(normalized_options),
@@ -176,9 +179,8 @@ class ScanNode : public cp::ExecNode {
   [[noreturn]] static void NoInputs() {
     Unreachable("no inputs; this should never be called");
   }
-  [[noreturn]] void InputReceived(cp::ExecNode*, cp::ExecBatch) override { NoInputs(); }
-  [[noreturn]] void ErrorReceived(cp::ExecNode*, Status) override { NoInputs(); }
-  [[noreturn]] void InputFinished(cp::ExecNode*, int) override { NoInputs(); }
+  [[noreturn]] Status InputReceived(cp::ExecNode*, cp::ExecBatch) override { NoInputs(); }
+  [[noreturn]] Status InputFinished(cp::ExecNode*, int) override { NoInputs(); }
 
   Status Init() override { return Status::OK(); }
 
@@ -200,6 +202,7 @@ class ScanNode : public cp::ExecNode {
       // case.
       cost_ = static_cast<int>(
           std::min(cost, static_cast<int64_t>(std::numeric_limits<int>::max())));
+      name_ = "ScanNode::ScanBatch::" + ::arrow::internal::ToChars(batch_index_);
     }
 
     Result<Future<>> operator()() override {
@@ -211,16 +214,19 @@ class ScanNode : public cp::ExecNode {
           });
     }
 
+    std::string_view name() const override { return name_; }
+
     Status HandleBatch(const std::shared_ptr<RecordBatch>& batch) {
       ARROW_ASSIGN_OR_RAISE(
           compute::ExecBatch evolved_batch,
           scan_->fragment_evolution->EvolveBatch(batch, node_->options_.columns,
                                                  scan_->scan_request.columns));
-      return node_->plan_->ScheduleTask(
+      node_->plan_->query_context()->ScheduleTask(
           [node = node_, evolved_batch = std::move(evolved_batch)] {
-            node->outputs_[0]->InputReceived(node, std::move(evolved_batch));
-            return Status::OK();
-          });
+            return node->output_->InputReceived(node, std::move(evolved_batch));
+          },
+          "ScanNode::ProcessMorsel");
+      return Status::OK();
     }
 
     int cost() const override { return cost_; }
@@ -229,19 +235,25 @@ class ScanNode : public cp::ExecNode {
     ScanState* scan_;
     int batch_index_;
     int cost_;
+    std::string name_;
   };
 
   struct ListFragmentTask : util::AsyncTaskScheduler::Task {
     ListFragmentTask(ScanNode* node, std::shared_ptr<Fragment> fragment)
-        : node(node), fragment(std::move(fragment)) {}
+        : node(node), fragment(std::move(fragment)) {
+      name_ = "ScanNode::ListFragment::" + this->fragment->ToString();
+    }
 
     Result<Future<>> operator()() override {
       return fragment
-          ->InspectFragment(node->options_.format_options, node->plan_->exec_context())
+          ->InspectFragment(node->options_.format_options,
+                            node->plan_->query_context()->exec_context())
           .Then([this](const std::shared_ptr<InspectedFragment>& inspected_fragment) {
             return BeginScan(inspected_fragment);
           });
     }
+
+    std::string_view name() const override { return name_; }
 
     Future<> BeginScan(const std::shared_ptr<InspectedFragment>& inspected_fragment) {
       // Now that we have an inspected fragment we need to use the dataset's evolution
@@ -252,7 +264,8 @@ class ScanNode : public cp::ExecNode {
       ARROW_RETURN_NOT_OK(InitFragmentScanRequest());
       return fragment
           ->BeginScan(scan_state->scan_request, *inspected_fragment,
-                      node->options_.format_options, node->plan_->exec_context())
+                      node->options_.format_options,
+                      node->plan_->query_context()->exec_context())
           .Then([this](const std::shared_ptr<FragmentScanner>& fragment_scanner) {
             return AddScanTasks(fragment_scanner);
           });
@@ -307,40 +320,37 @@ class ScanNode : public cp::ExecNode {
     ScanNode* node;
     std::shared_ptr<Fragment> fragment;
     std::unique_ptr<ScanState> scan_state = std::make_unique<ScanState>();
+    std::string name_;
   };
 
   void ScanFragments(const AsyncGenerator<std::shared_ptr<Fragment>>& frag_gen) {
     std::shared_ptr<util::AsyncTaskScheduler> fragment_tasks =
         util::MakeThrottledAsyncTaskGroup(
-            plan_->async_scheduler(), options_.fragment_readahead + 1,
-            /*queue=*/nullptr, [this]() {
-              outputs_[0]->InputFinished(this, num_batches_.load());
-              finished_.MarkFinished();
-              return Status::OK();
-            });
+            plan_->query_context()->async_scheduler(), options_.fragment_readahead + 1,
+            /*queue=*/nullptr,
+            [this]() { return output_->InputFinished(this, num_batches_.load()); });
     fragment_tasks->AddAsyncGenerator<std::shared_ptr<Fragment>>(
-        std::move(frag_gen), [this, fragment_tasks = std::move(fragment_tasks)](
-                                 const std::shared_ptr<Fragment>& fragment) {
+        std::move(frag_gen),
+        [this, fragment_tasks =
+                   std::move(fragment_tasks)](const std::shared_ptr<Fragment>& fragment) {
           fragment_tasks->AddTask(std::make_unique<ListFragmentTask>(this, fragment));
           return Status::OK();
-        });
+        },
+        "ScanNode::ListDataset::Next");
   }
 
   Status StartProducing() override {
-    START_COMPUTE_SPAN(span_, std::string(kind_name()) + ":" + label(),
-                       {{"node.kind", kind_name()},
-                        {"node.label", label()},
-                        {"node.output_schema", output_schema()->ToString()},
-                        {"node.detail", ToString()}});
-    END_SPAN_ON_FUTURE_COMPLETION(span_, finished_);
+    NoteStartProducing(ToStringExtra());
     batches_throttle_ = util::ThrottledAsyncTaskScheduler::Make(
-        plan_->async_scheduler(), options_.target_bytes_readahead + 1);
-    plan_->async_scheduler()->AddSimpleTask([this] {
-      return GetFragments(options_.dataset.get(), options_.filter)
-          .Then([this](const AsyncGenerator<std::shared_ptr<Fragment>>& frag_gen) {
-            ScanFragments(frag_gen);
-          });
-    });
+        plan_->query_context()->async_scheduler(), options_.target_bytes_readahead + 1);
+    plan_->query_context()->async_scheduler()->AddSimpleTask(
+        [this] {
+          return GetFragments(options_.dataset.get(), options_.filter)
+              .Then([this](const AsyncGenerator<std::shared_ptr<Fragment>>& frag_gen) {
+                ScanFragments(frag_gen);
+              });
+        },
+        "ScanNode::ListDataset::GetFragments"sv);
     return Status::OK();
   }
 
@@ -352,12 +362,7 @@ class ScanNode : public cp::ExecNode {
     // TODO(ARROW-17755)
   }
 
-  void StopProducing(ExecNode* output) override {
-    DCHECK_EQ(output, outputs_[0]);
-    StopProducing();
-  }
-
-  void StopProducing() override {}
+  Status StopProducingImpl() override { return Status::OK(); }
 
  private:
   ScanV2Options options_;

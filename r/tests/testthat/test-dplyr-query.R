@@ -662,19 +662,9 @@ test_that("Scalars in expressions match the type of the field, if possible", {
     0
   )
 
-  # int == string, this works in dplyr and here too
-  expect_output(
-    tab %>%
-      filter(int == "5") %>%
-      show_exec_plan(),
-    "int == 5",
-    fixed = TRUE
-  )
-  expect_equal(
-    tab %>%
-      filter(int == "5") %>%
-      nrow(),
-    1
+  # int == string, errors starting in dplyr 1.1.0
+  expect_snapshot_warning(
+    tab %>% filter(int == "5")
   )
 
   # Strings automatically parsed to date/timestamp
@@ -690,6 +680,12 @@ test_that("Scalars in expressions match the type of the field, if possible", {
       collect(),
     tbl_with_datetime
   )
+
+  # ARROW-18401: These will error if the system timezone is not valid. A PR was
+  # submitted to fix this docker image upstream; this skip can be removed after
+  # it merges.
+  # https://github.com/r-hub/rhub-linux-builders/pull/65
+  skip_if(identical(Sys.timezone(), "/UTC"))
 
   expect_output(
     tab %>%
@@ -717,4 +713,75 @@ test_that("Scalars in expressions match the type of the field, if possible", {
     ) %>%
     collect()
   expect_equal(result$tpc_h_1, result$as_dbl)
+})
+
+test_that("Can use nested field refs", {
+  nested_data <- tibble(int = 1:5, df_col = tibble(a = 6:10, b = 11:15))
+
+  compare_dplyr_binding(
+    .input %>%
+      mutate(
+        nested = df_col$a,
+        times2 = df_col$a * 2
+      ) %>%
+      filter(nested > 7) %>%
+      collect(),
+    nested_data
+  )
+
+  compare_dplyr_binding(
+    .input %>%
+      mutate(
+        nested = df_col$a,
+        times2 = df_col$a * 2
+      ) %>%
+      filter(nested > 7) %>%
+      summarize(sum(times2)) %>%
+      collect(),
+    nested_data
+  )
+
+  # Now with Dataset: make sure column pushdown in ScanNode works
+  skip_if_not_available("dataset")
+  expect_equal(
+    nested_data %>%
+      InMemoryDataset$create() %>%
+      mutate(
+        nested = df_col$a,
+        times2 = df_col$a * 2
+      ) %>%
+      filter(nested > 7) %>%
+      collect(),
+    nested_data %>%
+      mutate(
+        nested = df_col$a,
+        times2 = df_col$a * 2
+      ) %>%
+      filter(nested > 7)
+  )
+})
+
+test_that("Use struct_field for $ on non-field-ref", {
+  compare_dplyr_binding(
+    .input %>%
+      mutate(
+        df_col = tibble(i = int, d = dbl)
+      ) %>%
+      transmute(
+        int2 = df_col$i,
+        dbl2 = df_col$d
+      ) %>%
+      collect(),
+    example_data
+  )
+})
+
+test_that("nested field ref error handling", {
+  expect_error(
+    example_data %>%
+      arrow_table() %>%
+      mutate(x = int$nested) %>%
+      compute(),
+    "No match"
+  )
 })

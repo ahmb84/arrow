@@ -28,6 +28,7 @@
 #endif
 
 #include "arrow/compute/api_scalar.h"
+#include "arrow/compute/exec.h"
 #include "arrow/compute/kernels/codegen_internal.h"
 #include "arrow/compute/kernels/test_util.h"
 #include "arrow/testing/gtest_util.h"
@@ -494,6 +495,16 @@ TYPED_TEST(TestBaseBinaryKernels, FindSubstringRegex) {
   this->CheckUnary("find_substring_regex", R"(["a", "A", "baaa", null, "", "AaaA"])",
                    this->offset_type(), "[0, 0, 1, null, -1, 0]", &options);
 }
+
+TYPED_TEST(TestBaseBinaryKernels, FindSubstringRegexWrongPattern) {
+  MatchSubstringOptions options{"(a", /*ignore_case=*/false};
+
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid, ::testing::HasSubstr("Invalid regular expression"),
+      CallFunction("find_substring_regex",
+                   {Datum(R"(["a", "A", "baaa", null, "", "AaaA"])")}, &options));
+}
+
 #else
 TYPED_TEST(TestBaseBinaryKernels, FindSubstringIgnoreCase) {
   MatchSubstringOptions options{"a+", /*ignore_case=*/true};
@@ -1752,6 +1763,11 @@ TYPED_TEST(TestBaseBinaryKernels, ReplaceSubstringRegex) {
   options = ReplaceSubstringOptions{"(a.a)", "aba\\1"};
   this->CheckUnary("replace_substring_regex", R"(["aaaaaa"])", this->type(),
                    R"(["abaaaaabaaaa"])", &options);
+
+  // ARROW-18202: Allow matching against empty string again
+  options = ReplaceSubstringOptions{"^$", "x"};
+  this->CheckUnary("replace_substring_regex", R"([""])", this->type(), R"(["x"])",
+                   &options);
 
   // ARROW-12774
   options = ReplaceSubstringOptions{"X", "Y"};
